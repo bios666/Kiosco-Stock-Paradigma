@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Avalonia.Controls;
 using Avalonia.Interactivity;
+using Avalonia.Layout;
 using Avalonia.Media;
 using StockVentas.Models;
 using StockVentas.Services;
@@ -15,9 +16,13 @@ namespace StockVentas.Views
         private readonly PagoService _pagoService;
         private readonly VentaService _ventaService;
         private readonly HistorialService _historial;
+        private readonly EmpleadoService _empleadoService;
+        private readonly AuthService _authService;
+        private readonly SesionActual _sesion;
 
         private int? _productoSeleccionadoId; // null = alta de un producto nuevo
         private int? _ventaSeleccionadaId;
+        private int? _empleadoSeleccionadoId; // null = alta de un empleado nuevo
 
         // Pedido en curso, antes de confirmar la venta (igual que el "pedido" de la consola).
         private readonly List<(int ProductoId, int Cantidad)> _pedidoActual = new();
@@ -34,19 +39,30 @@ namespace StockVentas.Views
         {
             public int Id { get; init; }
             public string FechaTexto { get; init; } = "";
+            public string NombreUsuario { get; init; } = "";
             public MedioPago MedioPago { get; init; }
             public EstadoVenta Estado { get; init; }
             public string TotalTexto { get; init; } = "";
         }
 
+        // Item especial para el ComboBox de filtro "Todos" en Caja por empleado.
+        private sealed class OpcionEmpleado
+        {
+            public int? Id { get; init; }
+            public string NombreCompleto { get; init; } = "";
+        }
+
         // Constructor sin parámetros para el Previewer de Avalonia (no se usa en ejecución real).
-        public MainWindow() : this(new StockService(new HistorialService()), new PagoService(),
-            new VentaService(new StockService(new HistorialService()), new PagoService(), new HistorialService()),
-            new HistorialService())
+        public MainWindow() : this(
+            new StockService("", new HistorialService()), new PagoService(),
+            new VentaService("", new StockService("", new HistorialService()), new PagoService(), new HistorialService()),
+            new HistorialService(), new EmpleadoService("", new AuthService(""), new HistorialService()),
+            new AuthService(""), new SesionActual())
         { }
 
-        public MainWindow(StockService stockService, PagoService pagoService,
-                           VentaService ventaService, HistorialService historial)
+        public MainWindow(StockService stockService, PagoService pagoService, VentaService ventaService,
+                           HistorialService historial, EmpleadoService empleadoService, AuthService authService,
+                           SesionActual sesion)
         {
             InitializeComponent();
 
@@ -54,16 +70,35 @@ namespace StockVentas.Views
             _pagoService = pagoService;
             _ventaService = ventaService;
             _historial = historial;
+            _empleadoService = empleadoService;
+            _authService = authService;
+            _sesion = sesion;
 
             cboMedioPago.ItemsSource = Enum.GetValues(typeof(MedioPago));
             cboMedioPagoVenta.ItemsSource = Enum.GetValues(typeof(MedioPago));
+            cboRolEmpleado.ItemsSource = Enum.GetValues(typeof(RolUsuario));
 
-            CargarDatosDeEjemplo();
+            ConfigurarPorRol();
+            AsegurarDatosDeEjemplo();
             RecargarTodo();
         }
 
-        private void CargarDatosDeEjemplo()
+        private void ConfigurarPorRol()
         {
+            var usuario = _sesion.UsuarioActual;
+            txtUsuarioLogueado.Text = usuario == null
+                ? ""
+                : $"Conectado como: {usuario.NombreCompleto} ({usuario.Rol})";
+
+            tabEmpleados.IsVisible = _sesion.EsDueno;
+            tabCajaPorEmpleado.IsVisible = _sesion.EsDueno;
+        }
+
+        // Solo la primera vez (base recién creada, sin productos) se cargan datos de ejemplo.
+        private void AsegurarDatosDeEjemplo()
+        {
+            if (_stockService.ConsultarTodos().Count > 0) return;
+
             _stockService.RegistrarProducto("Coca Cola 500ml", "Gaseosa", "Bebidas", 1200m, 50);
             _stockService.RegistrarProducto("Pan Lactal", "Pan de molde", "Panificados", 1800m, 30);
             _stockService.RegistrarProducto("Fideos 500g", "Fideos secos", "Almacén", 900m, 40);
@@ -75,6 +110,13 @@ namespace StockVentas.Views
             RecargarCombosProducto();
             RecargarGrillaVentas();
             RecargarHistorial();
+
+            if (_sesion.EsDueno)
+            {
+                RecargarGrillaEmpleados();
+                RecargarFiltroEmpleados();
+                RecargarCajaPorEmpleado();
+            }
         }
 
         // Helper de estado reutilizado en todas las pestañas.
@@ -82,6 +124,55 @@ namespace StockVentas.Views
         {
             destino.Text = mensaje;
             destino.Foreground = esError ? Brushes.Crimson : Brushes.SeaGreen;
+        }
+
+        // ---------- BARRA DE USUARIO ----------
+
+        private void BtnCerrarSesion_Click(object? sender, RoutedEventArgs e)
+        {
+            _sesion.CerrarSesion();
+            var login = new LoginWindow(_stockService, _pagoService, _ventaService, _historial, _authService, _empleadoService, _sesion);
+            login.Show();
+            Close();
+        }
+
+        private void BtnCambiarMiPassword_Click(object? sender, RoutedEventArgs e)
+        {
+            var usuario = _sesion.UsuarioActual;
+            if (usuario == null) return;
+
+            var txtNueva = new TextBox { PasswordChar = '•', PlaceholderText = "Nueva contraseña" };
+            var txtEstado = new TextBlock { TextWrapping = Avalonia.Media.TextWrapping.Wrap };
+            var btnGuardar = new Button { Content = "Guardar", HorizontalAlignment = HorizontalAlignment.Right };
+
+            var panel = new StackPanel { Margin = new Avalonia.Thickness(20), Spacing = 10 };
+            panel.Children.Add(new TextBlock { Text = $"Nueva contraseña para {usuario.NombreUsuario}" });
+            panel.Children.Add(txtNueva);
+            panel.Children.Add(btnGuardar);
+            panel.Children.Add(txtEstado);
+
+            var dialog = new Window
+            {
+                Title = "Cambiar mi contraseña",
+                Width = 340,
+                Height = 220,
+                CanResize = false,
+                Content = panel,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner
+            };
+
+            btnGuardar.Click += (_, _) =>
+            {
+                var (ok, mensaje) = _authService.CambiarPassword(usuario.Id, txtNueva.Text ?? "");
+                if (ok) dialog.Close();
+                else
+                {
+                    txtEstado.Text = mensaje;
+                    txtEstado.Foreground = Brushes.Crimson;
+                }
+            };
+
+            dialog.ShowDialog(this);
         }
 
         // ---------- PRODUCTOS ----------
@@ -251,7 +342,7 @@ namespace StockVentas.Views
                 return;
             }
 
-            var (ok, mensaje, _) = _ventaService.RegistrarVenta(_pedidoActual, medio);
+            var (ok, mensaje, _) = _ventaService.RegistrarVenta(_pedidoActual, medio, _sesion.UsuarioActual!.Id);
             MostrarEstado(txtEstadoVenta, mensaje, esError: !ok);
 
             if (ok)
@@ -261,20 +352,24 @@ namespace StockVentas.Views
                 RecargarGrillaProductos(); // el stock cambió
                 RecargarGrillaVentas();
                 RecargarHistorial();
+                if (_sesion.EsDueno) RecargarCajaPorEmpleado();
             }
         }
 
         private void RecargarGrillaVentas()
         {
-            dgVentas.ItemsSource = _ventaService.ConsultarVentas().Select(v => new VentaFila
-            {
-                Id = v.Id,
-                FechaTexto = v.Fecha.ToString("dd/MM/yyyy HH:mm"),
-                MedioPago = v.MedioPago,
-                Estado = v.Estado,
-                TotalTexto = v.Total.ToString("C")
-            }).ToList();
+            dgVentas.ItemsSource = _ventaService.ConsultarVentas().Select(MapearVentaFila).ToList();
         }
+
+        private static VentaFila MapearVentaFila(Venta v) => new VentaFila
+        {
+            Id = v.Id,
+            FechaTexto = v.Fecha.ToString("dd/MM/yyyy HH:mm"),
+            NombreUsuario = v.NombreUsuario,
+            MedioPago = v.MedioPago,
+            Estado = v.Estado,
+            TotalTexto = v.Total.ToString("C")
+        };
 
         private void DgVentas_SelectionChanged(object? sender, SelectionChangedEventArgs e)
         {
@@ -302,6 +397,7 @@ namespace StockVentas.Views
                 RecargarGrillaProductos(); // el stock se restauró
                 RecargarGrillaVentas();
                 RecargarHistorial();
+                if (_sesion.EsDueno) RecargarCajaPorEmpleado();
             }
         }
 
@@ -310,5 +406,141 @@ namespace StockVentas.Views
         private void RecargarHistorial() => lstHistorial.ItemsSource = _historial.ConsultarHistorial().ToList();
 
         private void BtnRefrescarHistorial_Click(object? sender, RoutedEventArgs e) => RecargarHistorial();
+
+        // ---------- EMPLEADOS (solo Dueño) ----------
+
+        private void RecargarGrillaEmpleados()
+            => dgEmpleados.ItemsSource = _empleadoService.ConsultarEmpleados(incluirInactivos: true);
+
+        private void DgEmpleados_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+        {
+            if (dgEmpleados.SelectedItem is Usuario u)
+            {
+                _empleadoSeleccionadoId = u.Id;
+                txtIdEmpleadoSeleccionado.Text = $"Editando empleado ID {u.Id}";
+                txtUsuarioEmpleado.Text = u.NombreUsuario;
+                txtUsuarioEmpleado.IsEnabled = false; // el nombre de usuario no se cambia al editar
+                txtNombreCompletoEmpleado.Text = u.NombreCompleto;
+                cboRolEmpleado.SelectedItem = u.Rol;
+                txtPasswordEmpleado.Text = "";
+            }
+        }
+
+        private void BtnNuevoEmpleado_Click(object? sender, RoutedEventArgs? e)
+        {
+            _empleadoSeleccionadoId = null;
+            txtIdEmpleadoSeleccionado.Text = "Nuevo empleado";
+            txtUsuarioEmpleado.Text = "";
+            txtUsuarioEmpleado.IsEnabled = true;
+            txtNombreCompletoEmpleado.Text = "";
+            cboRolEmpleado.SelectedItem = RolUsuario.Empleado;
+            txtPasswordEmpleado.Text = "";
+        }
+
+        private void BtnGuardarEmpleado_Click(object? sender, RoutedEventArgs e)
+        {
+            var ejecutadoPor = _sesion.UsuarioActual!;
+            var rol = cboRolEmpleado.SelectedItem is RolUsuario r ? r : RolUsuario.Empleado;
+
+            if (_empleadoSeleccionadoId is null)
+            {
+                var (ok, mensaje, _) = _empleadoService.RegistrarEmpleado(
+                    ejecutadoPor, txtUsuarioEmpleado.Text ?? "", txtNombreCompletoEmpleado.Text ?? "",
+                    txtPasswordEmpleado.Text ?? "", rol);
+                MostrarEstado(txtEstadoEmpleados, mensaje, esError: !ok);
+                if (ok) BtnNuevoEmpleado_Click(null, null);
+            }
+            else
+            {
+                var (ok, mensaje) = _empleadoService.ModificarEmpleado(
+                    ejecutadoPor, _empleadoSeleccionadoId.Value, txtNombreCompletoEmpleado.Text ?? "", rol);
+                MostrarEstado(txtEstadoEmpleados, mensaje, esError: !ok);
+            }
+
+            RecargarGrillaEmpleados();
+            RecargarFiltroEmpleados();
+        }
+
+        private void BtnDesactivarEmpleado_Click(object? sender, RoutedEventArgs e)
+        {
+            if (_empleadoSeleccionadoId is null)
+            {
+                MostrarEstado(txtEstadoEmpleados, "Seleccione un empleado de la grilla.", esError: true);
+                return;
+            }
+
+            var (ok, mensaje) = _empleadoService.DesactivarEmpleado(_sesion.UsuarioActual!, _empleadoSeleccionadoId.Value);
+            MostrarEstado(txtEstadoEmpleados, mensaje, esError: !ok);
+            RecargarGrillaEmpleados();
+            RecargarFiltroEmpleados();
+        }
+
+        private void BtnReactivarEmpleado_Click(object? sender, RoutedEventArgs e)
+        {
+            if (_empleadoSeleccionadoId is null)
+            {
+                MostrarEstado(txtEstadoEmpleados, "Seleccione un empleado de la grilla.", esError: true);
+                return;
+            }
+
+            var (ok, mensaje) = _empleadoService.ReactivarEmpleado(_sesion.UsuarioActual!, _empleadoSeleccionadoId.Value);
+            MostrarEstado(txtEstadoEmpleados, mensaje, esError: !ok);
+            RecargarGrillaEmpleados();
+            RecargarFiltroEmpleados();
+        }
+
+        private void BtnResetearPasswordEmpleado_Click(object? sender, RoutedEventArgs e)
+        {
+            if (_empleadoSeleccionadoId is null)
+            {
+                MostrarEstado(txtEstadoEmpleados, "Seleccione un empleado de la grilla.", esError: true);
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(txtPasswordEmpleado.Text))
+            {
+                MostrarEstado(txtEstadoEmpleados, "Escriba la nueva contraseña en el campo Contraseña.", esError: true);
+                return;
+            }
+
+            var (ok, mensaje) = _empleadoService.ResetearPassword(
+                _sesion.UsuarioActual!, _empleadoSeleccionadoId.Value, txtPasswordEmpleado.Text);
+            MostrarEstado(txtEstadoEmpleados, mensaje, esError: !ok);
+            if (ok) txtPasswordEmpleado.Text = "";
+        }
+
+        // ---------- CAJA POR EMPLEADO (solo Dueño) ----------
+
+        private void RecargarFiltroEmpleados()
+        {
+            var opciones = new List<OpcionEmpleado> { new OpcionEmpleado { Id = null, NombreCompleto = "Todos" } };
+            opciones.AddRange(_empleadoService.ConsultarEmpleados(incluirInactivos: true)
+                .Select(u => new OpcionEmpleado { Id = u.Id, NombreCompleto = $"{u.NombreCompleto} ({u.NombreUsuario})" }));
+
+            cboFiltroEmpleado.ItemsSource = opciones;
+            cboFiltroEmpleado.SelectedIndex = 0;
+        }
+
+        private void RecargarCajaPorEmpleado()
+        {
+            int? usuarioId = (cboFiltroEmpleado.SelectedItem as OpcionEmpleado)?.Id;
+            DateTime? desde = dpDesde.SelectedDate?.Date;
+            DateTime? hasta = dpHasta.SelectedDate?.Date;
+
+            dgVentasPorEmpleado.ItemsSource = _ventaService.ConsultarVentas(usuarioId, desde, hasta)
+                .Select(MapearVentaFila).ToList();
+            dgResumenPorEmpleado.ItemsSource = _ventaService.ConsultarResumenPorEmpleado(desde, hasta)
+                .Where(r => usuarioId == null || r.UsuarioId == usuarioId)
+                .ToList();
+        }
+
+        private void BtnConsultarCaja_Click(object? sender, RoutedEventArgs e) => RecargarCajaPorEmpleado();
+
+        private void BtnLimpiarFiltroCaja_Click(object? sender, RoutedEventArgs e)
+        {
+            cboFiltroEmpleado.SelectedIndex = 0;
+            dpDesde.SelectedDate = null;
+            dpHasta.SelectedDate = null;
+            RecargarCajaPorEmpleado();
+        }
     }
 }

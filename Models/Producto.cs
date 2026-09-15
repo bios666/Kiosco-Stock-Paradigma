@@ -10,6 +10,7 @@ namespace StockVentas.Models
         public string Categoria { get; set; } = string.Empty;
         public decimal PrecioBase { get; set; }
         public int Stock { get; set; }
+        public bool Activo { get; set; } = true;
         public DateTime FechaAlta { get; set; } = DateTime.Now;
 
         public override string ToString()
